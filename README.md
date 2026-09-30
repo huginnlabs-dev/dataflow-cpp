@@ -128,16 +128,81 @@ std::string dataflow::clip_statement("SELECT  *\n FROM  t");        // "SELECT *
 They mirror dataflow-go's `StmtSummary`/`ClipStatement`, so both SDKs group
 identical statement shapes on the dashboard.
 
+## Route scanning
+
+`dataflow scan` (SDK 0.4.0+) is a static route scanner: it extracts the HTTP
+endpoints declared in a C++ codebase and publishes them to the server
+catalog (`POST {base}/api/v1/catalog`, `X-Api-Key` header):
+
+```json
+{
+  "service_name": "shop",
+  "routes": [
+    {"method": "GET", "path": "/api/orders/:id", "handler": "OrderController::show",
+     "source_file": "src/controllers/orders.cpp"}
+  ]
+}
+```
+
+Extraction is line/regex based — routes must be declared with plain string
+literal paths, which are kept as written (`:id` / `{id}` params included).
+Supported shapes:
+
+- **Crow** — `CROW_ROUTE(app, "/path")`, method taken from a
+  `.methods(crow::HTTPMethod::POST)` / `CROW_HTTP_METHOD::POST` /
+  `"POST"_method` chain, `GET` when the chain is absent;
+- **cpp-httplib** — `svr.Get("/path", handler)` and
+  `Post` / `Put` / `Delete` / `Head` / `Options` / `Patch`;
+- **Pistache** — `routes().get("/path", handler)` and `router.post(...)`
+  (lowercase verbs; `router.del` maps to `DELETE`);
+- **Drogon** — `METHOD_ADD` / `ADD_METHOD_TO` macros (best effort; the first
+  listed verb wins).
+
+The handler is the macro/function name where trivially visible — anonymous
+lambdas report `""`. Files scanned: `*.cpp *.cc *.cxx *.hpp *.h` under the
+root, skipping `build/` and `.git/`; at most 1000 routes are posted.
+
+### Build
+
+```sh
+# Windows (MinGW)
+g++ -std=c++17 -Iinclude tools/scan_main.cpp src/scan.cpp src/dataflow.cpp -lwinhttp -lbcrypt -o dataflow-scan
+# Linux
+g++ -std=c++17 -Iinclude tools/scan_main.cpp src/scan.cpp src/dataflow.cpp -o dataflow-scan
+```
+
+### Usage
+
+```sh
+dataflow-scan --dir src --service shop --url http://localhost:25080 --api-key KEY
+dataflow-scan --dir . --print     # inspect the catalog JSON without posting
+```
+
+| flag | meaning | default |
+|------|---------|---------|
+| `--dir DIR` | source root to scan | `.` |
+| `--service NAME` | service name | `$DATAFLOW_SERVICE_NAME`, else DIR basename |
+| `--url URL` | server base URL | `$DATAFLOW_HTTP_URL`, else URL-form `$DATAFLOW_ENDPOINT` |
+| `--api-key KEY` | API key | `$DATAFLOW_API_KEY` |
+| `--print` | print the JSON to stdout instead of posting | off |
+
+A bare `host:port` `DATAFLOW_ENDPOINT` (no scheme) is skipped with a message
+on stderr, mirroring the SDK manifest rule. Exit status: `0` success
+(including "no routes found" — nothing is posted then), `1` posting or
+base-URL failure, `2` usage error.
+
 ## Tests
 
-`tests/test_stmt_summary.cpp` is a standalone assert-based test for the
-statement helpers:
+`tests/test_stmt_summary.cpp` (statement helpers) and `tests/test_scan.cpp`
+(route extraction + catalog JSON) are standalone assert-based tests:
 
 ```sh
 # Windows (MinGW)
 g++ -std=c++17 -Iinclude tests/test_stmt_summary.cpp src/dataflow.cpp -lwinhttp -lbcrypt -o test_stmt_summary
+g++ -std=c++17 -Iinclude tests/test_scan.cpp src/scan.cpp src/dataflow.cpp -lwinhttp -lbcrypt -o test_scan
 # Linux
 g++ -std=c++17 -Iinclude tests/test_stmt_summary.cpp src/dataflow.cpp -o test_stmt_summary
+g++ -std=c++17 -Iinclude tests/test_scan.cpp src/scan.cpp src/dataflow.cpp -o test_scan
 
-./test_stmt_summary
+./test_stmt_summary && ./test_scan
 ```

@@ -5,6 +5,7 @@
 // wire-identical REST ingest batches (POST /api/v1/ingest).
 
 #include "dataflow.hpp"
+#include "dataflow_internal.hpp"
 
 #include <algorithm>
 #include <atomic>
@@ -38,6 +39,156 @@
 #endif
 
 namespace dataflow {
+
+// ---------------------------------------------------------------------------
+// detail — implementation helpers shared with src/scan.cpp (the route
+// scanner tool); declared in src/dataflow_internal.hpp. Everything else in
+// this file stays file-local.
+namespace detail {
+
+std::string json_escape(const std::string& s) {
+    std::string out;
+    out.reserve(s.size() + 8);
+    for (unsigned char c : s) {
+        switch (c) {
+            case '"': out += "\\\""; break;
+            case '\\': out += "\\\\"; break;
+            case '\n': out += "\\n"; break;
+            case '\r': out += "\\r"; break;
+            case '\t': out += "\\t"; break;
+            default:
+                if (c < 0x20) {
+                    char buf[8];
+                    std::snprintf(buf, sizeof(buf), "\\u%04x", c);
+                    out += buf;
+                } else {
+                    out += static_cast<char>(c);
+                }
+        }
+    }
+    return out;
+}
+
+// ParsedUrl lives in dataflow_internal.hpp (scan.cpp needs the type too).
+
+ParsedUrl parse_url(const std::string& url) {
+    ParsedUrl out;
+    std::string rest = url;
+    auto scheme_end = rest.find("://");
+    if (scheme_end != std::string::npos) {
+        out.scheme = rest.substr(0, scheme_end);
+        rest = rest.substr(scheme_end + 3);
+        if (out.scheme == "https") out.port = 443;
+    }
+    auto slash = rest.find('/');
+    std::string hostport = slash == std::string::npos ? rest : rest.substr(0, slash);
+    out.path = slash == std::string::npos ? "/" : rest.substr(slash);
+    if (!hostport.empty()) {
+        auto colon = hostport.rfind(':');
+        if (colon != std::string::npos) {
+            try { out.port = std::stoi(hostport.substr(colon + 1)); } catch (...) {}
+            out.host = hostport.substr(0, colon);
+        } else {
+            out.host = hostport;
+        }
+    }
+    return out;
+}
+
+#ifdef _WIN32
+
+bool http_post_json(const ParsedUrl& ep, const std::string& path, const std::string& api_key,
+                    const std::vector<std::pair<std::string, std::string>>& headers,
+                    const std::string& body, long& status, std::string& response,
+                    std::string& error, int timeout_secs) {
+    bool secure = ep.scheme == "https";
+    std::wstring whost(ep.host.begin(), ep.host.end());
+    std::wstring wpath(path.begin(), path.end());
+    HINTERNET session = WinHttpOpen(L"dataflow-cpp", WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
+                                    WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
+    if (!session) { error = "WinHttpOpen failed"; return false; }
+    HINTERNET connect = WinHttpConnect(session, whost.c_str(),
+                                       static_cast<INTERNET_PORT>(ep.port), 0);
+    if (!connect) {
+        error = "WinHttpConnect failed";
+        WinHttpCloseHandle(session);
+        return false;
+    }
+    HINTERNET request = WinHttpOpenRequest(connect, L"POST", wpath.c_str(), nullptr,
+                                           WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES,
+                                           secure ? WINHTTP_FLAG_SECURE : 0);
+    bool ok = false;
+    if (request) {
+        DWORD timeout = static_cast<DWORD>(timeout_secs) * 1000;
+        WinHttpSetOption(request, WINHTTP_OPTION_RECEIVE_TIMEOUT, &timeout, sizeof(timeout));
+        std::wstring wh = L"content-type: application/json\r\nx-api-key: " +
+                          std::wstring(api_key.begin(), api_key.end());
+        for (const auto& kv : headers) {
+            std::wstring k(kv.first.begin(), kv.first.end());
+            std::wstring v(kv.second.begin(), kv.second.end());
+            wh += L"\r\n" + k + L": " + v;
+        }
+        if (WinHttpSendRequest(request, wh.c_str(), static_cast<DWORD>(wh.size()),
+                               LPVOID(const_cast<char*>(body.data())),
+                               static_cast<DWORD>(body.size()),
+                               static_cast<DWORD>(body.size()), 0) &&
+            WinHttpReceiveResponse(request, nullptr)) {
+            DWORD st = 0, size = sizeof(st);
+            WinHttpQueryHeaders(request, WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
+                                WINHTTP_HEADER_NAME_BY_INDEX, &st, &size, WINHTTP_NO_HEADER_INDEX);
+            status = static_cast<long>(st);
+            DWORD read = 0;
+            char buf[8192];
+            while (WinHttpReadData(request, buf, sizeof(buf), &read) && read > 0) {
+                response.append(buf, read);
+                read = 0;
+            }
+            ok = true;
+        } else {
+            error = "send/receive failed (GetLastError=" + std::to_string(GetLastError()) + ")";
+        }
+        WinHttpCloseHandle(request);
+    } else {
+        error = "WinHttpOpenRequest failed";
+    }
+    WinHttpCloseHandle(connect);
+    WinHttpCloseHandle(session);
+    return ok;
+}
+
+#else
+
+bool http_post_json(const ParsedUrl& ep, const std::string& path, const std::string& api_key,
+                    const std::vector<std::pair<std::string, std::string>>& headers,
+                    const std::string& body, long& status, std::string& response,
+                    std::string& error, int timeout_secs) {
+    httplib::Client client(ep.scheme + "://" + ep.host + ":" + std::to_string(ep.port));
+    client.set_connection_timeout(5, 0);
+    client.set_read_timeout(timeout_secs, 0);
+    httplib::Headers h = {{"x-api-key", api_key}};
+    for (const auto& kv : headers) h.emplace(kv.first, kv.second);
+    if (auto res = client.Post(path, h, body, "application/json")) {
+        status = res->status;
+        response = res->body;
+        return true;
+    } else if (res.error() != httplib::Error::Success) {
+        error = httplib::to_string(res.error());
+    } else {
+        error = "unknown http client error";
+    }
+    return false;
+}
+
+#endif
+
+} // namespace detail
+
+// The rest of this file uses the shared helpers unqualified.
+using detail::ParsedUrl;
+using detail::http_post_json;
+using detail::json_escape;
+using detail::parse_url;
+
 namespace {
 
 // ---------------------------------------------------------------------------
@@ -90,29 +241,6 @@ std::string new_id() {
     for (int i = 15; i >= 0; --i) {
         out[i] = hex[v & 0xF];
         v >>= 4;
-    }
-    return out;
-}
-
-std::string json_escape(const std::string& s) {
-    std::string out;
-    out.reserve(s.size() + 8);
-    for (unsigned char c : s) {
-        switch (c) {
-            case '"': out += "\\\""; break;
-            case '\\': out += "\\\\"; break;
-            case '\n': out += "\\n"; break;
-            case '\r': out += "\\r"; break;
-            case '\t': out += "\\t"; break;
-            default:
-                if (c < 0x20) {
-                    char buf[8];
-                    std::snprintf(buf, sizeof(buf), "\\u%04x", c);
-                    out += buf;
-                } else {
-                    out += static_cast<char>(c);
-                }
-        }
     }
     return out;
 }
@@ -405,37 +533,6 @@ void enqueue(const std::shared_ptr<Span::Impl>& impl) {
     g_wake.notify_one();
 }
 
-struct ParsedUrl {
-    std::string scheme = "http";
-    std::string host;
-    int port = 80;
-    std::string path = "/";
-};
-
-ParsedUrl parse_url(const std::string& url) {
-    ParsedUrl out;
-    std::string rest = url;
-    auto scheme_end = rest.find("://");
-    if (scheme_end != std::string::npos) {
-        out.scheme = rest.substr(0, scheme_end);
-        rest = rest.substr(scheme_end + 3);
-        if (out.scheme == "https") out.port = 443;
-    }
-    auto slash = rest.find('/');
-    std::string hostport = slash == std::string::npos ? rest : rest.substr(0, slash);
-    out.path = slash == std::string::npos ? "/" : rest.substr(slash);
-    if (!hostport.empty()) {
-        auto colon = hostport.rfind(':');
-        if (colon != std::string::npos) {
-            try { out.port = std::stoi(hostport.substr(colon + 1)); } catch (...) {}
-            out.host = hostport.substr(0, colon);
-        } else {
-            out.host = hostport;
-        }
-    }
-    return out;
-}
-
 long long extract_last_seq(const std::string& body) {
     const std::string key = "\"last_seq\"";
     auto pos = body.find(key);
@@ -446,92 +543,6 @@ long long extract_last_seq(const std::string& body) {
     while (pos < body.size() && std::isspace(static_cast<unsigned char>(body[pos]))) ++pos;
     try { return std::stoll(body.substr(pos)); } catch (...) { return -1; }
 }
-
-#ifdef _WIN32
-
-bool http_post_json(const ParsedUrl& ep, const std::string& path, const std::string& api_key,
-                    const std::vector<std::pair<std::string, std::string>>& headers,
-                    const std::string& body, long& status, std::string& response,
-                    std::string& error, int timeout_secs = 10) {
-    bool secure = ep.scheme == "https";
-    std::wstring whost(ep.host.begin(), ep.host.end());
-    std::wstring wpath(path.begin(), path.end());
-    HINTERNET session = WinHttpOpen(L"dataflow-cpp", WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
-                                    WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
-    if (!session) { error = "WinHttpOpen failed"; return false; }
-    HINTERNET connect = WinHttpConnect(session, whost.c_str(),
-                                       static_cast<INTERNET_PORT>(ep.port), 0);
-    if (!connect) {
-        error = "WinHttpConnect failed";
-        WinHttpCloseHandle(session);
-        return false;
-    }
-    HINTERNET request = WinHttpOpenRequest(connect, L"POST", wpath.c_str(), nullptr,
-                                           WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES,
-                                           secure ? WINHTTP_FLAG_SECURE : 0);
-    bool ok = false;
-    if (request) {
-        DWORD timeout = static_cast<DWORD>(timeout_secs) * 1000;
-        WinHttpSetOption(request, WINHTTP_OPTION_RECEIVE_TIMEOUT, &timeout, sizeof(timeout));
-        std::wstring wh = L"content-type: application/json\r\nx-api-key: " +
-                          std::wstring(api_key.begin(), api_key.end());
-        for (const auto& kv : headers) {
-            std::wstring k(kv.first.begin(), kv.first.end());
-            std::wstring v(kv.second.begin(), kv.second.end());
-            wh += L"\r\n" + k + L": " + v;
-        }
-        if (WinHttpSendRequest(request, wh.c_str(), static_cast<DWORD>(wh.size()),
-                               LPVOID(const_cast<char*>(body.data())),
-                               static_cast<DWORD>(body.size()),
-                               static_cast<DWORD>(body.size()), 0) &&
-            WinHttpReceiveResponse(request, nullptr)) {
-            DWORD st = 0, size = sizeof(st);
-            WinHttpQueryHeaders(request, WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
-                                WINHTTP_HEADER_NAME_BY_INDEX, &st, &size, WINHTTP_NO_HEADER_INDEX);
-            status = static_cast<long>(st);
-            DWORD read = 0;
-            char buf[8192];
-            while (WinHttpReadData(request, buf, sizeof(buf), &read) && read > 0) {
-                response.append(buf, read);
-                read = 0;
-            }
-            ok = true;
-        } else {
-            error = "send/receive failed (GetLastError=" + std::to_string(GetLastError()) + ")";
-        }
-        WinHttpCloseHandle(request);
-    } else {
-        error = "WinHttpOpenRequest failed";
-    }
-    WinHttpCloseHandle(connect);
-    WinHttpCloseHandle(session);
-    return ok;
-}
-
-#else
-
-bool http_post_json(const ParsedUrl& ep, const std::string& path, const std::string& api_key,
-                    const std::vector<std::pair<std::string, std::string>>& headers,
-                    const std::string& body, long& status, std::string& response,
-                    std::string& error, int timeout_secs = 10) {
-    httplib::Client client(ep.scheme + "://" + ep.host + ":" + std::to_string(ep.port));
-    client.set_connection_timeout(5, 0);
-    client.set_read_timeout(timeout_secs, 0);
-    httplib::Headers h = {{"x-api-key", api_key}};
-    for (const auto& kv : headers) h.emplace(kv.first, kv.second);
-    if (auto res = client.Post(path, h, body, "application/json")) {
-        status = res->status;
-        response = res->body;
-        return true;
-    } else if (res.error() != httplib::Error::Success) {
-        error = httplib::to_string(res.error());
-    } else {
-        error = "unknown http client error";
-    }
-    return false;
-}
-
-#endif
 
 std::string buffer_to_json() {
     std::vector<std::shared_ptr<Span::Impl>> batch;
