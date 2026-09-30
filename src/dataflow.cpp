@@ -880,6 +880,102 @@ void send_manifest_once() {
     }).detach();
 }
 
+// ---------------------------------------------------------------------------
+// SQL statement summary (DB_QUERY spans) — hand-rolled port of dataflow-go's
+// stmtSummary/clipStatement so the dashboard groups identical shapes across
+// SDKs. Operates on a whitespace-normalized copy of the statement.
+
+std::string collapse_spaces(const std::string& sql) {
+    std::string out;
+    out.reserve(sql.size());
+    bool pending_space = false;
+    for (char c : sql) {
+        if (std::isspace(static_cast<unsigned char>(c))) {
+            pending_space = true;
+            continue;
+        }
+        if (pending_space && !out.empty()) out += ' ';
+        pending_space = false;
+        out += c;
+    }
+    return out;
+}
+
+bool is_word(char c) {
+    return std::isalnum(static_cast<unsigned char>(c)) || c == '_';
+}
+
+std::string upper_ascii(std::string s) {
+    for (char& c : s) c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+    return s;
+}
+
+// The word starting at pos ("" when none); advances pos past it.
+std::string word_at(const std::string& s, size_t& pos) {
+    size_t start = pos;
+    while (pos < s.size() && is_word(s[pos])) ++pos;
+    return upper_ascii(s.substr(start, pos - start));
+}
+
+bool is_sql_verb(const std::string& w) {
+    static const char* const verbs[] = {
+        "SELECT", "INSERT", "UPDATE", "DELETE", "CREATE", "DROP", "ALTER",
+        "TRUNCATE", "WITH", "BEGIN", "COMMIT", "ROLLBACK", "SET", "CALL",
+        "EXEC", "SHOW", "EXPLAIN",
+    };
+    for (const char* v : verbs) {
+        if (w == v) return true;
+    }
+    return false;
+}
+
+// Consumes "IF [NOT] EXISTS" plus its trailing whitespace when the full
+// sequence is present; otherwise returns the start unchanged (the group is
+// all-or-nothing, like the reference regexp).
+size_t skip_if_exists(const std::string& s, size_t start) {
+    size_t i = start;
+    const std::string w1 = word_at(s, i);
+    if (w1 != "IF" || i == start) return start;
+    size_t j = i;
+    while (j < s.size() && std::isspace(static_cast<unsigned char>(s[j]))) ++j;
+    if (j == i) return start; // IF must be followed by whitespace
+    i = j;
+    std::string w2 = word_at(s, i);
+    if (w2 == "NOT") {
+        j = i;
+        while (j < s.size() && std::isspace(static_cast<unsigned char>(s[j]))) ++j;
+        if (j == i) return start;
+        i = j;
+        w2 = word_at(s, i);
+    }
+    if (w2 != "EXISTS" || w2.empty()) return start;
+    j = i;
+    while (j < s.size() && std::isspace(static_cast<unsigned char>(s[j]))) ++j;
+    if (j == i) return start; // EXISTS must be followed by whitespace
+    return j;
+}
+
+// The table reference following a FROM|INTO|UPDATE|TABLE|JOIN keyword whose
+// text ends at kw_end; "" when no identifier follows the keyword.
+std::string table_after_keyword(const std::string& one, size_t kw_end) {
+    size_t i = kw_end;
+    while (i < one.size() && std::isspace(static_cast<unsigned char>(one[i]))) ++i;
+    if (i == kw_end) return ""; // \s+ after the keyword is required
+    i = skip_if_exists(one, i);
+    static const std::string quotes = "`\"'[";
+    if (i < one.size() && quotes.find(one[i]) != std::string::npos) ++i;
+    if (i >= one.size() || !(std::isalpha(static_cast<unsigned char>(one[i])) || one[i] == '_')) {
+        return "";
+    }
+    size_t j = i + 1;
+    while (j < one.size() && (is_word(one[j]) || one[j] == '.' || one[j] == '$')) ++j;
+    std::string table = one.substr(i, j - i);
+    // Schema-qualified names ("public.items") report the bare table.
+    size_t cut = table.find_last_of(".$");
+    if (cut != std::string::npos) table = table.substr(cut + 1);
+    return table;
+}
+
 } // namespace
 
 // ---------------------------------------------------------------------------
@@ -1076,5 +1172,97 @@ HttpResponse http_post(const std::string& url, const std::string& body,
                        const std::string& content_type, int timeout_ms) {
     return traced_request("POST", url, body, content_type, timeout_ms);
 }
+
+// --- transport spans ---------------------------------------------------------
+
+std::string clip_statement(const std::string& sql) {
+    std::string one = collapse_spaces(sql);
+    if (one.size() > 200) one.resize(200);
+    return one;
+}
+
+std::string stmt_summary(const std::string& sql) {
+    const std::string one = collapse_spaces(sql);
+    // Verb: optional leading paren, then the first word — only when it is a
+    // known SQL verb (word boundary included: "SELECT2" is not "SELECT").
+    size_t i = 0;
+    if (!one.empty() && one[0] == '(') {
+        ++i;
+        while (i < one.size() && std::isspace(static_cast<unsigned char>(one[i]))) ++i;
+    }
+    const std::string verb = word_at(one, i);
+    if (verb.empty() || !is_sql_verb(verb) ||
+        (i < one.size() && is_word(one[i]))) {
+        // Non-SQL fallback: the first word uppercased, or "QUERY" when the
+        // statement is empty or starts with punctuation.
+        size_t cut = one.find_first_of(" (");
+        if (cut == std::string::npos || cut == 0) return "QUERY";
+        return upper_ascii(one.substr(0, cut));
+    }
+    // First table reference: FROM|INTO|UPDATE|TABLE|JOIN anywhere in the
+    // statement (the UPDATE verb itself qualifies), skipping IF [NOT] EXISTS.
+    static const char* const keywords[] = {"FROM", "INTO", "UPDATE", "TABLE", "JOIN"};
+    for (size_t p = 0; p < one.size(); ++p) {
+        if (p != 0 && is_word(one[p - 1])) continue; // \b before the keyword
+        for (const char* kw : keywords) {
+            const size_t len = std::strlen(kw);
+            if (upper_ascii(one.substr(p, len)) != kw) continue;
+            const std::string table = table_after_keyword(one, p + len);
+            if (!table.empty()) return verb + " " + table;
+        }
+    }
+    return verb;
+}
+
+HttpSpan::HttpSpan(const std::string& method, const std::string& url) {
+    const ParsedUrl ep = parse_url(url);
+    std::string path = ep.path;
+    size_t cut = path.find_first_of("?#");
+    if (cut != std::string::npos) path.resize(cut);
+    span_ = start_span(method + " " + ep.host + path, kHttpClient);
+    if (span_) {
+        span_.set_callee(ep.host);
+        span_.set_attr("http.method", method);
+        span_.set_attr("http.url", url);
+    }
+}
+
+HttpSpan::~HttpSpan() {
+    try {
+        span_.end();
+    } catch (...) {
+        // Never let span bookkeeping escape a destructor.
+    }
+}
+
+void HttpSpan::set_status(int code) { span_.set_status(code); }
+
+void HttpSpan::record_error(const std::string& message) { span_.record_error(message); }
+
+const std::string& HttpSpan::trace_id() const { return span_.trace_id(); }
+
+DbSpan::DbSpan(const std::string& system, const std::string& statement) {
+    span_ = start_span(stmt_summary(statement), kDbQuery);
+    if (span_) {
+        span_.set_callee(system);
+        span_.set_attr("db.system", system);
+        const std::string clipped = clip_statement(statement);
+        if (!clipped.empty()) span_.set_attr("db.statement", clipped);
+    }
+}
+
+DbSpan::~DbSpan() {
+    try {
+        span_.end();
+    } catch (...) {
+        // Never let span bookkeeping escape a destructor.
+    }
+}
+
+void DbSpan::set_status(int code) { span_.set_status(code); }
+
+void DbSpan::record_error(const std::string& message) { span_.record_error(message); }
+
+const std::string& DbSpan::trace_id() const { return span_.trace_id(); }
 
 } // namespace dataflow

@@ -33,13 +33,14 @@
 
 namespace dataflow {
 
-inline constexpr const char* kVersion = "0.2.0";
+inline constexpr const char* kVersion = "0.3.0";
 
 // Event types, mirroring proto/dataflow.proto string names.
 inline constexpr const char* kHttpServer = "HTTP_SERVER";
 inline constexpr const char* kHttpClient = "HTTP_CLIENT";
 inline constexpr const char* kFunctionCall = "FUNCTION_CALL";
 inline constexpr const char* kGrpc = "GRPC";
+inline constexpr const char* kDbQuery = "DB_QUERY";
 
 struct Settings {
     std::string api_key;
@@ -163,5 +164,67 @@ HttpResponse http_get(const std::string& url, int timeout_ms = 10000);
 HttpResponse http_post(const std::string& url, const std::string& body,
                        const std::string& content_type = "application/json",
                        int timeout_ms = 10000);
+
+// ---------------------------------------------------------------------------
+// Transport spans — RAII helpers for outgoing HTTP calls and database
+// queries. They issue no I/O of their own: you keep your own HTTP/DB client
+// and just bracket the call, the same way Trace brackets a function. Both
+// are passive when the SDK is disabled or the span is unsampled, and their
+// destructors never throw.
+
+// Statement helpers (pure, unit-testable in tests/test_stmt_summary.cpp).
+// "SELECT id FROM public.orders WHERE ..." summarizes to "SELECT orders";
+// the statement text is collapsed to single spaces and clipped to 200
+// characters. Bind values are never captured — pass only SQL text.
+std::string stmt_summary(const std::string& sql);
+std::string clip_statement(const std::string& sql);
+
+// RAII HTTP_CLIENT span named "METHOD host/path" with callee = host and
+// http.method / http.url metadata. Join it to the receiving side by
+// sending the trace header alongside your request:
+//
+//     dataflow::HttpSpan hs("GET", "https://api.example.com/v1/users");
+//     headers["X-Dataflow-Trace-Id"] = hs.trace_id();
+//     ... perform the request ...
+//     hs.set_status(response.status);          // last call wins
+//
+// The span ends (with duration) at scope exit.
+class HttpSpan {
+public:
+    HttpSpan(const std::string& method, const std::string& url);
+    ~HttpSpan();
+    HttpSpan(const HttpSpan&) = delete;
+    HttpSpan& operator=(const HttpSpan&) = delete;
+    void set_status(int code);
+    void record_error(const std::string& message);
+    const std::string& trace_id() const;
+
+private:
+    Span span_;
+};
+
+// RAII DB_QUERY span over (system, statement): the name is "<VERB> <table>"
+// derived from the statement (see stmt_summary), callee_package is the db
+// system, and metadata carries db.system plus the clipped db.statement.
+// Execute the query yourself and bind values through your driver — they are
+// never passed to the SDK.
+//
+//     dataflow::DbSpan db("postgres", "SELECT * FROM orders WHERE id = $1");
+//     ... PQexecParams / your driver call ...
+//     db.set_status(200);                      // or record_error + 500
+//
+class DbSpan {
+public:
+    DbSpan(const std::string& system, const std::string& statement);
+    ~DbSpan();
+    DbSpan(const DbSpan&) = delete;
+    DbSpan& operator=(const DbSpan&) = delete;
+    void set_status(int code);
+    void record_error(const std::string& message);
+    const std::string& trace_id() const;
+
+private:
+    Span span_;
+};
 
 } // namespace dataflow
