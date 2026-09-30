@@ -15,7 +15,11 @@
 //
 // Env: DATAFLOW_API_KEY, DATAFLOW_ENDPOINT (http(s)://base), 
 //      DATAFLOW_SERVICE_NAME, DATAFLOW_ENCRYPTION_KEY, DATAFLOW_SAMPLE_RATIO,
-//      DATAFLOW_BUFFER_SIZE, DATAFLOW_DISABLED.
+//      DATAFLOW_BUFFER_SIZE, DATAFLOW_DISABLED, DATAFLOW_APP_VERSION,
+//      DATAFLOW_HTTP_URL (base URL for the startup service manifest).
+//
+// At startup configure() also posts a one-shot "service manifest" to
+// POST /api/v1/manifest (best-effort, detached thread, failures ignored).
 
 #pragma once
 
@@ -29,7 +33,7 @@
 
 namespace dataflow {
 
-inline constexpr const char* kVersion = "0.1.0";
+inline constexpr const char* kVersion = "0.2.0";
 
 // Event types, mirroring proto/dataflow.proto string names.
 inline constexpr const char* kHttpServer = "HTTP_SERVER";

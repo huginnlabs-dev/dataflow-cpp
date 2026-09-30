@@ -452,7 +452,7 @@ long long extract_last_seq(const std::string& body) {
 bool http_post_json(const ParsedUrl& ep, const std::string& path, const std::string& api_key,
                     const std::vector<std::pair<std::string, std::string>>& headers,
                     const std::string& body, long& status, std::string& response,
-                    std::string& error) {
+                    std::string& error, int timeout_secs = 10) {
     bool secure = ep.scheme == "https";
     std::wstring whost(ep.host.begin(), ep.host.end());
     std::wstring wpath(path.begin(), path.end());
@@ -471,7 +471,7 @@ bool http_post_json(const ParsedUrl& ep, const std::string& path, const std::str
                                            secure ? WINHTTP_FLAG_SECURE : 0);
     bool ok = false;
     if (request) {
-        DWORD timeout = 10000;
+        DWORD timeout = static_cast<DWORD>(timeout_secs) * 1000;
         WinHttpSetOption(request, WINHTTP_OPTION_RECEIVE_TIMEOUT, &timeout, sizeof(timeout));
         std::wstring wh = L"content-type: application/json\r\nx-api-key: " +
                           std::wstring(api_key.begin(), api_key.end());
@@ -513,10 +513,10 @@ bool http_post_json(const ParsedUrl& ep, const std::string& path, const std::str
 bool http_post_json(const ParsedUrl& ep, const std::string& path, const std::string& api_key,
                     const std::vector<std::pair<std::string, std::string>>& headers,
                     const std::string& body, long& status, std::string& response,
-                    std::string& error) {
+                    std::string& error, int timeout_secs = 10) {
     httplib::Client client(ep.scheme + "://" + ep.host + ":" + std::to_string(ep.port));
     client.set_connection_timeout(5, 0);
-    client.set_read_timeout(10, 0);
+    client.set_read_timeout(timeout_secs, 0);
     httplib::Headers h = {{"x-api-key", api_key}};
     for (const auto& kv : headers) h.emplace(kv.first, kv.second);
     if (auto res = client.Post(path, h, body, "application/json")) {
@@ -668,12 +668,18 @@ const std::vector<std::pair<std::string, std::string>>& agent_attrs() {
         std::string os_name, arch, compiler;
 #if defined(_WIN32)
         os_name = "windows";
-#  if defined(_M_ARM64)
+#  if defined(_M_ARM64) || defined(__aarch64__)
         arch = "arm64";
 #  else
         arch = "amd64";
 #  endif
+#  if defined(_MSC_VER)
         compiler = "msvc-" + std::to_string(_MSC_VER);
+#  elif defined(__GNUC__) && defined(__GNUC_MINOR__)
+        compiler = "gcc-" + std::to_string(__GNUC__) + "." + std::to_string(__GNUC_MINOR__);
+#  else
+        compiler = "cpp";
+#  endif
 #else
         os_name = "linux";
 #  if defined(__aarch64__)
@@ -790,6 +796,90 @@ HttpResponse traced_request(const char* method, const std::string& url, const st
     return out;
 }
 
+// ---------------------------------------------------------------------------
+// service manifest (POST /api/v1/manifest) — sent once at startup, best-effort
+
+// Compile/runtime target, e.g. "windows/amd64" or "linux/arm64". Unknown
+// components stay empty instead of being guessed.
+std::string manifest_os_arch() {
+#if defined(_WIN32)
+    const char* os = "windows";
+#elif defined(__APPLE__)
+    const char* os = "macos";
+#elif defined(__linux__)
+    const char* os = "linux";
+#else
+    const char* os = "";
+#endif
+#if defined(__x86_64__) || defined(_M_X64)
+    const char* arch = "amd64";
+#elif defined(__aarch64__) || defined(_M_ARM64)
+    const char* arch = "arm64";
+#elif defined(__i386__) || defined(_M_IX86)
+    const char* arch = "x86";
+#else
+    const char* arch = "";
+#endif
+    if (!*os && !*arch) return "";
+    if (!*os) return arch;
+    if (!*arch) return os;
+    return std::string(os) + "/" + arch;
+}
+
+std::string build_manifest(const std::string& service_name, const std::string& sdk_version) {
+    std::string json = "{";
+    json += "\"service_name\":\"" + json_escape(service_name) + "\",";
+    json += "\"language\":\"cpp\",";
+    json += "\"sdk_version\":\"" + json_escape(sdk_version) + "\",";
+    json += "\"runtime_version\":\"\",";
+    json += "\"framework\":\"\",";
+    json += "\"os_arch\":\"" + json_escape(manifest_os_arch()) + "\",";
+    json += "\"app_version\":\"" + json_escape(env_or("DATAFLOW_APP_VERSION", "")) + "\",";
+    json += "\"dependencies\":[]";
+    json += "}";
+    return json;
+}
+
+// Base URL for the manifest endpoint: DATAFLOW_HTTP_URL wins (trailing slash
+// trimmed); otherwise the configured endpoint when it carries an http(s)
+// scheme. configure() derives "http://" for bare host:port values, and that
+// same derived scheme is honored here.
+std::string manifest_http_base() {
+    std::string base = env_or("DATAFLOW_HTTP_URL", "");
+    if (base.empty()) {
+        const std::string& ep = g_settings.endpoint;
+        if (ep.rfind("http://", 0) == 0 || ep.rfind("https://", 0) == 0) base = ep;
+    }
+    while (!base.empty() && base.back() == '/') base.pop_back();
+    return base;
+}
+
+void send_manifest_once() {
+    if (!enabled()) return;
+    std::string base = manifest_http_base();
+    if (base.empty()) return;
+    static std::atomic<bool> sent{false};
+    if (sent.exchange(true)) return;
+    // Snapshot the settings: the detached thread must not race with a later
+    // configure() override ("safe to call again").
+    std::string service = g_settings.service_name;
+    std::string api_key = g_settings.api_key;
+    std::thread([base = std::move(base), service = std::move(service),
+                 api_key = std::move(api_key)] {
+        try {
+            std::string body = build_manifest(service, kVersion);
+            ParsedUrl ep = parse_url(base);
+            long status = 0;
+            std::string response, error;
+            http_post_json(ep, "/api/v1/manifest", api_key, {}, body, status, response, error, 5);
+            // Response and status are intentionally ignored: the manifest is
+            // best-effort and any server-side failure is swallowed.
+        } catch (...) {
+            // Never let manifest failures surface or affect startup/tracing.
+        }
+    }).detach();
+}
+
 } // namespace
 
 // ---------------------------------------------------------------------------
@@ -817,6 +907,7 @@ void configure(const Settings& cfg) {
         g_settings.endpoint = "http://" + g_settings.endpoint;
     }
     ensure_sender_started();
+    send_manifest_once();
     if (enabled() && g_settings.encryption_key.empty()) {
         std::fprintf(stderr, "dataflow: warning: no encryption key set; payloads are sent as plaintext\n");
     }
