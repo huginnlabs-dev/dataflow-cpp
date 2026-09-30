@@ -10,11 +10,13 @@ Go/Python SDKs.
 
 ## Build
 
-Add the header include dir and the single translation unit to your project:
+Add the header include dir and the translation units to your project:
 
 ```text
-include/dataflow.hpp   — public API
-src/dataflow.cpp       — implementation
+include/dataflow.hpp      — public API
+src/dataflow.cpp          — implementation
+include/dataflow_crash.hpp — crash capture API (optional, see below)
+src/crash.cpp             — crash capture implementation (optional)
 ```
 
 MSVC 2019+ and MinGW-w64 both build it. MinGW example:
@@ -128,6 +130,55 @@ std::string dataflow::clip_statement("SELECT  *\n FROM  t");        // "SELECT *
 They mirror dataflow-go's `StmtSummary`/`ClipStatement`, so both SDKs group
 identical statement shapes on the dashboard.
 
+## Crash capture
+
+C++ has no panics — the SDK targets uncaught exceptions and `std::terminate`.
+`include/dataflow_crash.hpp` + `src/crash.cpp` (SDK 0.5.0+) add:
+
+- `dataflow::Capture(fn)` — runs `fn()` and returns `true` on a clean run.
+  When `fn` throws, the backtrace is captured **inside the catch** (so the
+  failing call path is still on the stack), the crash is recorded and `false`
+  is returned — the exception itself is consumed.
+- `dataflow::CaptureException(e)` — record an exception you caught yourself;
+  because the throw site's stack is gone by then, the caller's current stack
+  is recorded (call it as close to the catch as possible).
+- `dataflow::CaptureTerminate()` — installs a `std::terminate` handler that
+  records a synthetic `terminate` span (with the active exception's `what()`
+  when the runtime still hands it over, else `"terminate"`), synchronously
+  flushes the submission pipeline, then chains to the previous terminate
+  handler. Installing twice is a no-op.
+
+Wire convention (both paths): the record lands on the currently-active span —
+or a synthetic `exception` span when none is open — with `status_code = 500`,
+`error_message` = the exception message clipped to 500 bytes, and metadata
+`error.stack` = the backtrace text clipped to 8192 bytes
+(`<backtrace unavailable>` when the platform refuses to cooperate).
+
+```cpp
+#include "dataflow.hpp"
+#include "dataflow_crash.hpp"
+
+int main() {
+    dataflow::configure();                 // reads DATAFLOW_* env
+    dataflow::CaptureTerminate();          // once, first thing in main()
+
+    if (!dataflow::Capture([] {            // false when the body threw
+        dataflow::Trace trace("scheduler.Run");
+        run_scheduler();
+    })) {
+        // crash recorded; decide your own recovery/exit policy
+    }
+}
+```
+
+Stack capture is platform best-effort and adds no dependencies — Windows:
+`RtlCaptureStackBackTrace` + `SymFromAddr` (dbghelp loaded at runtime with
+`GetProcAddress`, never linked, every failure guarded down to raw module
+addresses); POSIX: `backtrace()`/`backtrace_symbols()` from `<execinfo.h>`.
+The whole crash path is wrapped so it never throws, and with the SDK
+disabled everything is a passthrough (`fn` runs bare, the terminate handler
+chains immediately).
+
 ## Route scanning
 
 `dataflow scan` (SDK 0.4.0+) is a static route scanner: it extracts the HTTP
@@ -193,16 +244,19 @@ base-URL failure, `2` usage error.
 
 ## Tests
 
-`tests/test_stmt_summary.cpp` (statement helpers) and `tests/test_scan.cpp`
-(route extraction + catalog JSON) are standalone assert-based tests:
+`tests/test_stmt_summary.cpp` (statement helpers), `tests/test_scan.cpp`
+(route extraction + catalog JSON) and `tests/test_crash.cpp` (crash capture)
+are standalone assert-based tests:
 
 ```sh
 # Windows (MinGW)
 g++ -std=c++17 -Iinclude tests/test_stmt_summary.cpp src/dataflow.cpp -lwinhttp -lbcrypt -o test_stmt_summary
 g++ -std=c++17 -Iinclude tests/test_scan.cpp src/scan.cpp src/dataflow.cpp -lwinhttp -lbcrypt -o test_scan
+g++ -std=c++17 -Iinclude tests/test_crash.cpp src/crash.cpp src/dataflow.cpp -lwinhttp -lbcrypt -o test_crash
 # Linux
 g++ -std=c++17 -Iinclude tests/test_stmt_summary.cpp src/dataflow.cpp -o test_stmt_summary
 g++ -std=c++17 -Iinclude tests/test_scan.cpp src/scan.cpp src/dataflow.cpp -o test_scan
+g++ -std=c++17 -Iinclude tests/test_crash.cpp src/crash.cpp src/dataflow.cpp -o test_crash
 
-./test_stmt_summary && ./test_scan
+./test_stmt_summary && ./test_scan && ./test_crash
 ```

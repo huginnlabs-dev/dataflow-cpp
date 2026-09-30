@@ -990,6 +990,37 @@ std::string table_after_keyword(const std::string& one, size_t kw_end) {
 } // namespace
 
 // ---------------------------------------------------------------------------
+// detail — internals shared with src/crash.cpp (crash capture); declared in
+// src/dataflow_internal.hpp. Must stay above the public API section because
+// it reads the file-local buffer machinery above.
+namespace detail {
+
+Span::Impl* current_impl() { return t_current; }
+
+void flush_now() {
+    if (!enabled()) return;
+    // No retries: one synchronous pass over the buffer is all a crashing
+    // process can afford. Ack trimming uses the same path as sender_loop().
+    for (int round = 0; round < 20; ++round) {
+        const std::string body = buffer_to_json();
+        if (body.empty()) return;
+        ParsedUrl ep = parse_url(g_settings.endpoint);
+        long status = 0;
+        std::string response, error;
+        if (http_post_json(ep, "/api/v1/ingest", g_settings.api_key, {}, body, status, response, error) &&
+            status == 200) {
+            const long long last_seq = extract_last_seq(response);
+            if (last_seq <= 0) return;
+            trim_acked(last_seq);
+        } else {
+            return;
+        }
+    }
+}
+
+} // namespace detail
+
+// ---------------------------------------------------------------------------
 // public API
 
 void configure() {

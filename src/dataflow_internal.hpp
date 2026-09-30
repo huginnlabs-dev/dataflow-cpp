@@ -6,6 +6,8 @@
 
 #pragma once
 
+#include "dataflow.hpp"
+
 #include <string>
 #include <utility>
 #include <vector>
@@ -34,6 +36,17 @@ bool http_post_json(const ParsedUrl& ep, const std::string& path, const std::str
                     const std::vector<std::pair<std::string, std::string>>& headers,
                     const std::string& body, long& status, std::string& response,
                     std::string& error, int timeout_secs = 10);
+
+// The span currently active on this thread (nullptr when none) — exposed so
+// the crash recorder (src/crash.cpp) can annotate the in-flight span without
+// ending it (the public current_span() carries only the ids).
+Span::Impl* current_impl();
+
+// Best-effort synchronous flush of buffered spans to the ingest endpoint:
+// posts the unacked batches and trims on ack, without the background loop's
+// retry/backoff (the crash path cannot rely on the sender thread running
+// again). Never throws; a transport failure just returns.
+void flush_now();
 
 } // namespace detail
 } // namespace dataflow
