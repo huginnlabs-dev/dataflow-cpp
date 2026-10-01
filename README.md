@@ -17,6 +17,8 @@ include/dataflow.hpp      — public API
 src/dataflow.cpp          — implementation
 include/dataflow_crash.hpp — crash capture API (optional, see below)
 src/crash.cpp             — crash capture implementation (optional)
+include/dataflow_logs.hpp — application log shipping API (optional, see below)
+src/logs.cpp              — application log shipping implementation (optional)
 ```
 
 MSVC 2019+ and MinGW-w64 both build it. MinGW example:
@@ -179,6 +181,49 @@ The whole crash path is wrapped so it never throws, and with the SDK
 disabled everything is a passthrough (`fn` runs bare, the terminate handler
 chains immediately).
 
+## Log capture
+
+`include/dataflow_logs.hpp` + `src/logs.cpp` (SDK 0.6.0+) ship application
+logs with trace correlation: every line is stamped with the current span's
+trace/span ids (when one is active on the calling thread), so logs line up
+with traces in the dashboard's Logs tab.
+
+- `dataflow::LogDebug / LogInfo / LogWarn / LogError(msg, fields)` — fixed
+  levels; `fields` is a `std::map<std::string, std::string>`.
+- `dataflow::Log(level, msg, fields)` — explicit level (`debug` | `info` |
+  `warn` | `error`, case-insensitive; `warning` maps to `warn`; anything
+  unknown degrades to `info`).
+- `dataflow::FlushLogs()` — synchronously ship the buffered lines (explicit
+  shutdown paths call it before exit; the background flusher otherwise
+  handles shipping).
+
+Lines are buffered in-process (1024 lines, drop-oldest on overflow) and a
+background flusher POSTs them in batches to `{base}/api/v1/logs` (`X-Api-Key`
+header, at most 1000 lines per batch, one retry per batch then the batch is
+dropped) every 500ms or once 50 lines are buffered. Best-effort by contract:
+logging never throws, never blocks the caller on I/O, and with the SDK
+disabled every call is a no-op. The base URL follows the manifest's
+resolution rule (`DATAFLOW_HTTP_URL` wins; otherwise the configured endpoint;
+bare `host:port` endpoints get a derived `http://` scheme, matching the
+startup manifest report).
+
+Wire caps mirrored client-side, same as the Go SDK: messages clip to 8192
+bytes, at most 50 fields per line with values clipped to 512 bytes.
+
+```cpp
+#include "dataflow.hpp"
+#include "dataflow_logs.hpp"
+
+int main() {
+    dataflow::configure();                  // reads DATAFLOW_* env
+
+    dataflow::Trace trace("scheduler.Run");
+    dataflow::LogInfo("job started", {{"job", "42"}});
+    // ... ids correlate with the active span ...
+    dataflow::FlushLogs();                  // optional: ship before exit
+}
+```
+
 ## Route scanning
 
 `dataflow scan` (SDK 0.4.0+) is a static route scanner: it extracts the HTTP
@@ -245,18 +290,21 @@ base-URL failure, `2` usage error.
 ## Tests
 
 `tests/test_stmt_summary.cpp` (statement helpers), `tests/test_scan.cpp`
-(route extraction + catalog JSON) and `tests/test_crash.cpp` (crash capture)
-are standalone assert-based tests:
+(route extraction + catalog JSON), `tests/test_crash.cpp` (crash capture) and
+`tests/test_logs.cpp` (application log shipping) are standalone assert-based
+tests:
 
 ```sh
 # Windows (MinGW)
 g++ -std=c++17 -Iinclude tests/test_stmt_summary.cpp src/dataflow.cpp -lwinhttp -lbcrypt -o test_stmt_summary
 g++ -std=c++17 -Iinclude tests/test_scan.cpp src/scan.cpp src/dataflow.cpp -lwinhttp -lbcrypt -o test_scan
 g++ -std=c++17 -Iinclude tests/test_crash.cpp src/crash.cpp src/dataflow.cpp -lwinhttp -lbcrypt -o test_crash
+g++ -std=c++17 -Iinclude tests/test_logs.cpp src/logs.cpp src/dataflow.cpp -lwinhttp -lbcrypt -o test_logs
 # Linux
 g++ -std=c++17 -Iinclude tests/test_stmt_summary.cpp src/dataflow.cpp -o test_stmt_summary
 g++ -std=c++17 -Iinclude tests/test_scan.cpp src/scan.cpp src/dataflow.cpp -o test_scan
 g++ -std=c++17 -Iinclude tests/test_crash.cpp src/crash.cpp src/dataflow.cpp -o test_crash
+g++ -std=c++17 -Iinclude tests/test_logs.cpp src/logs.cpp src/dataflow.cpp -o test_logs
 
-./test_stmt_summary && ./test_scan && ./test_crash
+./test_stmt_summary && ./test_scan && ./test_crash && ./test_logs
 ```

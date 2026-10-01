@@ -33,7 +33,7 @@
 
 namespace dataflow {
 
-inline constexpr const char* kVersion = "0.5.0";
+inline constexpr const char* kVersion = "0.6.0";
 
 // Event types, mirroring proto/dataflow.proto string names.
 inline constexpr const char* kHttpServer = "HTTP_SERVER";
