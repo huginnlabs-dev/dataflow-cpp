@@ -317,5 +317,8 @@ instrumentation / Dataflow SDK / OpenTelemetry), one shared load driver,
 spans exported live. Methodology, current numbers and reproduction steps:
 Numbers are published in each SDK README as they are measured; the full harness lives in the Dataflow monorepo `bench/`.
 
-Numbers for this SDK: **queued** — the harness follows the same contract
-and will land here.
+Measured for this SDK (dockerized Debian/g++, cpp-httplib server, one
+span per request, REST export live): baseline 1921 rps, **1982 rps
+instrumented** - within the run-to-run noise floor; the export pipeline
+runs on a background thread. No official OTEL C++ SDK exists, so the OTEL
+comparison column is not applicable here.
