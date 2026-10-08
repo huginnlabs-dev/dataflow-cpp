@@ -1,4 +1,11 @@
+<div align="center">
+
+  <img src="assets/mark.svg" width="72" alt="Dataflow mark" />
+
 # dataflow-cpp — HuginnLabs Dataflow SDK for C++
+
+</div>
+
 
 C++17 tracing SDK for the HuginnLabs Dataflow platform: RAII spans, a
 thread-local trace context and a background sender that ships events to the
